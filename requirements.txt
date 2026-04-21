@@ -1,3 +1,0 @@
-python-telegram-bot==20.7
-python-pptx==0.6.21
-Pillow==9.5.0

@@ -629,7 +629,7 @@ def create_pptx(session: dict) -> BytesIO:
         photo_card(slide, e2["photo"], mx+bw+gap, my, bw, bh,
                    e2["location"]["name"], e2.get("note",""))
 
-    # ── صفحة صورة واحدة
+    # ── صفحة صورة واحدة — متوسطة الحجم
     def make_single_slide(entry, idx, total):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         add_bg(slide); add_corners(slide)
@@ -638,9 +638,10 @@ def create_pptx(session: dict) -> BytesIO:
         txt(slide, date, W-Inches(4.6), Inches(0.15), Inches(4), Inches(0.35),
             size=10, color=BROWN, align=PP_ALIGN.LEFT)
 
-        mx, my = Inches(2.0), Inches(0.55)
-        bw     = W - mx*2
-        bh     = H - my - Inches(0.38)
+        # هوامش أكبر = صورة متوسطة
+        mx, my = Inches(2.8), Inches(0.6)
+        bw     = W - mx * 2
+        bh     = H - my - Inches(0.45)
         photo_card(slide, entry["photo"], mx, my, bw, bh,
                    entry["location"]["name"], entry.get("note",""))
 

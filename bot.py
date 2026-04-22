@@ -952,7 +952,6 @@ def main():
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, start),
         ],
         states={
             WAITING_CODE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_code)],

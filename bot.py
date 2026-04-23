@@ -570,18 +570,19 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE, cu
 
 def new_session(user_id, name, dept):
     user_sessions[user_id] = {
-        "photos":        [],
-        "name":          name,
-        "dept":          dept,
-        "report_type":   "normal",
-        "date":          datetime.now().strftime("%Y/%m/%d"),
-        "last_location": None,
-        "last_coords_dms": "",
-        "pending_photo": None,
-        "pending_plot":  "",
-        "pending_group":  [],
-        "pending_photos": [],
-        "group_timer":    None,
+        "photos":           [],
+        "name":             name,
+        "dept":             dept,
+        "report_type":      "normal",
+        "date":             datetime.now().strftime("%Y/%m/%d"),
+        "last_location":    None,
+        "last_coords_dms":  "",
+        "pending_photo":    None,
+        "pending_plot":     "",
+        "pending_photos":   [],
+        "pending_group_map": {},   # media_group_id -> [bytes, ...]
+        "active_group_id":  None,
+        "group_msg_id":     None,
     }
 
 
@@ -718,64 +719,53 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════
 #  معالج media group (صور متعددة دفعة واحدة)
 # ══════════════════════════════════════════════════
-async def _flush_media_group(user_id: int, bot, chat_id: int):
-    """
-    ينتظر حتى تتوقف الصور عن الوصول (كل مرة تصل صورة يُمدَّد الانتظار)،
-    ثم يعالج كل الصور المجمّعة دفعة واحدة.
-    """
-    WAIT = 3.0   # ثوانٍ انتظار بعد آخر صورة
+def _collect_pending_photos(session: dict) -> list:
+    """يجمع كل الصور المعلقة: pending_photo + pending_group_map + pending_photos"""
+    photos = []
+    # الصورة المنفردة المعلقة
+    if session.get("pending_photo"):
+        photos.append(session["pending_photo"])
+    # صور المجموعة
+    group_map = session.get("pending_group_map", {})
+    active_id = session.get("active_group_id")
+    if active_id and active_id in group_map:
+        photos.extend(group_map[active_id])
+    elif group_map:
+        # إذا لم يكن هناك active_id خذ كل الصور من كل المجموعات
+        for grp in group_map.values():
+            photos.extend(grp)
+    # صور إضافية (pending_photos القديمة)
+    photos.extend(session.get("pending_photos", []))
+    # إزالة التكرار مع الحفاظ على الترتيب
+    seen = set()
+    unique = []
+    for p in photos:
+        pid = id(p)
+        if pid not in seen:
+            seen.add(pid)
+            unique.append(p)
+    return unique
 
-    session = user_sessions.get(user_id)
-    if not session:
-        return
 
-    # طالما تصل صور جديدة، استمر في الانتظار
-    while True:
-        count_before = len(session.get("pending_group", []))
-        await asyncio.sleep(WAIT)
-        session = user_sessions.get(user_id)
-        if not session:
-            return
-        count_after = len(session.get("pending_group", []))
-        if count_after == count_before:
-            break   # لم تصل صور جديدة خلال فترة الانتظار
-
-    group = session.get("pending_group", [])
-    if not group:
-        return
-
-    all_photos = list(group)
-    session["pending_photos"] = all_photos[1:]
-    session["pending_photo"]  = all_photos[0]
-    session["pending_group"]  = []
-    session["group_timer"]    = None
-
-    count = len(all_photos)
-
-    if session.get("last_location"):
-        loc = session["last_location"]["name"]
-        kb  = [[KeyboardButton("✅ نفس الموقع")], [KeyboardButton("📍 موقع جديد")]]
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"📸 استلمت *{count}* صور\n📍 الموقع السابق: *{loc}*\nهل نفس الموقع؟",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
-        )
+def _build_group_keyboard(count: int, has_location: bool, loc_name: str = "") -> tuple:
+    """يبني رسالة وكيبورد استلام الصور المتعددة"""
+    if has_location:
+        kb = [
+            [KeyboardButton(f"✅ نفس الموقع ({count} صور)")],
+            [KeyboardButton("📍 موقع جديد")]
+        ]
+        text = f"📸 استلمت *{count}* صور\n📍 الموقع السابق: *{loc_name}*\nهل نفس الموقع؟"
     else:
         kb = [[KeyboardButton("📍 مشاركة موقعي", request_location=True)]]
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"📸 استلمت *{count}* صور\n\n"
-                "📍 *الموقع إجباري* — أرسله بإحدى الطرق:\n\n"
-                "1️⃣ اضغط 'مشاركة موقعي'\n"
-                "2️⃣ أرسل رابط جوجل ماب\n"
-                "3️⃣ أرسل إحداثيات: `23.085, 54.016`\n\n"
-                "⚠️ يجب أن يكون في نطاق منطقة ليوا"
-            ),
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+        text = (
+            f"📸 استلمت *{count}* صور\n\n"
+            "📍 *الموقع إجباري* — أرسله بإحدى الطرق:\n\n"
+            "1️⃣ اضغط 'مشاركة موقعي'\n"
+            "2️⃣ أرسل رابط جوجل ماب\n"
+            "3️⃣ أرسل إحداثيات: `23.085, 54.016`\n\n"
+            "⚠️ يجب أن يكون في نطاق منطقة ليوا"
         )
+    return text, ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 async def receive_photo(update, context):
     user_id = update.effective_user.id
@@ -793,17 +783,35 @@ async def receive_photo(update, context):
     # ── معالجة media group (صور متعددة دفعة واحدة)
     media_group_id = update.message.media_group_id
     if media_group_id:
-        # أضف الصورة للمجموعة
-        session.setdefault("pending_group", []).append(photo_bytes)
+        group_dict = session.setdefault("pending_group_map", {})
+        group_list = group_dict.setdefault(media_group_id, [])
+        group_list.append(photo_bytes)
 
-        # أنشئ task واحد فقط للمجموعة كلها (لا تُلغِه عند كل صورة)
-        existing_task = session.get("group_timer")
-        if not existing_task or existing_task.done():
-            chat_id  = update.effective_chat.id
-            new_task = asyncio.create_task(
-                _flush_media_group(user_id, context.bot, chat_id)
-            )
-            session["group_timer"] = new_task
+        # في كل مرة تصل صورة، حدّث عداد الرسالة أو أرسلها لأول مرة
+        count = len(group_list)
+        has_loc = bool(session.get("last_location"))
+        loc_name = session["last_location"]["name"] if has_loc else ""
+        text, markup = _build_group_keyboard(count, has_loc, loc_name)
+
+        # خزّن group_id الحالي حتى نعرف أي مجموعة نعالج
+        session["active_group_id"] = media_group_id
+
+        # أرسل/حدّث رسالة العداد (نرسل فقط للصورة الأولى ثم نحدّث)
+        msg_id = session.get("group_msg_id")
+        if not msg_id:
+            sent = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+            session["group_msg_id"] = sent.message_id
+        else:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=msg_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+            except Exception:
+                pass
 
         return WAITING_LOCATION
 
@@ -868,30 +876,25 @@ async def receive_location_text(update: Update, context: ContextTypes.DEFAULT_TY
     text = update.message.text.strip()
 
     if "نفس الموقع" in text and session.get("last_location"):
-        # أضف الصورة الأولى
-        session["photos"].append({
-            "photo":          session["pending_photo"],
-            "location":       session["last_location"],
-            "coords_dms":     session.get("last_coords_dms", ""),
-            "plot_no":        session.get("pending_plot", ""),
-            "note":           "",
-            "awareness_type": "",
-            "type":           "normal"
-        })
-        session["pending_photo"] = None
-        session["pending_plot"]  = ""
-        # أضف باقي الصور المعلقة بنفس الموقع
-        for extra_photo in session.get("pending_photos", []):
+        loc      = session["last_location"]
+        coords   = session.get("last_coords_dms", "")
+        all_photos = _collect_pending_photos(session)
+        for i, ph in enumerate(all_photos):
             session["photos"].append({
-                "photo":          extra_photo,
-                "location":       session["last_location"],
-                "coords_dms":     session.get("last_coords_dms", ""),
-                "plot_no":        "",
+                "photo":          ph,
+                "location":       loc,
+                "coords_dms":     coords,
+                "plot_no":        session.get("pending_plot", "") if i == 0 else "",
                 "note":           "",
                 "awareness_type": "",
                 "type":           "normal"
             })
-        session["pending_photos"] = []
+        session["pending_photo"]     = None
+        session["pending_plot"]      = ""
+        session["pending_photos"]    = []
+        session["pending_group_map"] = {}
+        session["active_group_id"]   = None
+        session["group_msg_id"]      = None
         return await next_after_location(session, update)
 
     if "موقع جديد" in text:
@@ -925,32 +928,26 @@ async def process_location(update, session, lat, lng):
         return False
 
     coords = decimal_to_dms(lat, lng)
-    # أضف الصورة الأولى (pending_photo)
-    session["photos"].append({
-        "photo":          session["pending_photo"],
-        "location":       loc_data,
-        "coords_dms":     coords,
-        "plot_no":        session.get("pending_plot", ""),
-        "note":           "",
-        "awareness_type": "",
-        "type":           "normal"
-    })
-    session["pending_photo"] = None
-    session["pending_plot"]  = ""
-    # أضف باقي الصور المعلقة (من media group) بنفس الموقع
-    for extra_photo in session.get("pending_photos", []):
+    # اجمع كل الصور المعلقة (منفردة + مجموعة)
+    all_photos = _collect_pending_photos(session)
+    for i, ph in enumerate(all_photos):
         session["photos"].append({
-            "photo":          extra_photo,
+            "photo":          ph,
             "location":       loc_data,
             "coords_dms":     coords,
-            "plot_no":        "",
+            "plot_no":        session.get("pending_plot", "") if i == 0 else "",
             "note":           "",
             "awareness_type": "",
             "type":           "normal"
         })
-    session["pending_photos"] = []
-    session["last_location"] = loc_data
-    session["last_coords_dms"] = coords
+    session["pending_photo"]     = None
+    session["pending_plot"]      = ""
+    session["pending_photos"]    = []
+    session["pending_group_map"] = {}
+    session["active_group_id"]   = None
+    session["group_msg_id"]      = None
+    session["last_location"]     = loc_data
+    session["last_coords_dms"]   = coords
     total = len(session["photos"])
     await update.message.reply_text(
         f"✅ *{loc_data['name']}*" + (f" — {total} صورة مضافة" if total > 1 else ""),

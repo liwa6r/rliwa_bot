@@ -541,7 +541,7 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE, cu
         if photos:
             # احتفظ بالصورة لكن امسح الموقع
             last = photos[-1]
-            session["pending_photo"] = last["photo"]
+            session.setdefault("queued_photos", []).insert(0, last["photo"])
             photos.pop()
         await ask_location(update)
         return WAITING_LOCATION
@@ -577,10 +577,8 @@ def new_session(user_id, name, dept):
         "date":             datetime.now().strftime("%Y/%m/%d"),
         "last_location":    None,
         "last_coords_dms":  "",
-        "pending_photo":    None,
         "pending_plot":     "",
-        "pending_photos":   [],
-        "pending_group_map": {},   # media_group_id -> [bytes, ...]
+        "queued_photos":    [],    # كل الصور المعلقة (منفردة أو مجموعة)
         "active_group_id":  None,
         "group_msg_id":     None,
     }
@@ -720,31 +718,8 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  معالج media group (صور متعددة دفعة واحدة)
 # ══════════════════════════════════════════════════
 def _collect_pending_photos(session: dict) -> list:
-    """يجمع كل الصور المعلقة: pending_photo + pending_group_map + pending_photos"""
-    photos = []
-    # الصورة المنفردة المعلقة
-    if session.get("pending_photo"):
-        photos.append(session["pending_photo"])
-    # صور المجموعة
-    group_map = session.get("pending_group_map", {})
-    active_id = session.get("active_group_id")
-    if active_id and active_id in group_map:
-        photos.extend(group_map[active_id])
-    elif group_map:
-        # إذا لم يكن هناك active_id خذ كل الصور من كل المجموعات
-        for grp in group_map.values():
-            photos.extend(grp)
-    # صور إضافية (pending_photos القديمة)
-    photos.extend(session.get("pending_photos", []))
-    # إزالة التكرار مع الحفاظ على الترتيب
-    seen = set()
-    unique = []
-    for p in photos:
-        pid = id(p)
-        if pid not in seen:
-            seen.add(pid)
-            unique.append(p)
-    return unique
+    """يُرجع كل الصور المعلقة في قائمة queued_photos"""
+    return list(session.get("queued_photos", []))
 
 
 def _build_group_keyboard(count: int, has_location: bool, loc_name: str = "") -> tuple:
@@ -788,18 +763,14 @@ async def receive_photo(update, context):
     # ── معالجة media group (صور متعددة دفعة واحدة)
     media_group_id = update.message.media_group_id
     if media_group_id:
-        group_dict = session.setdefault("pending_group_map", {})
-        group_list = group_dict.setdefault(media_group_id, [])
-        group_list.append(photo_bytes)
+        # أضف الصورة لقائمة الانتظار المشتركة
+        session.setdefault("queued_photos", []).append(photo_bytes)
+        session["active_group_id"] = media_group_id
+        count = len(session["queued_photos"])
 
-        # في كل مرة تصل صورة، حدّث عداد الرسالة أو أرسلها لأول مرة
-        count = len(group_list)
-        has_loc = bool(session.get("last_location"))
+        has_loc  = bool(session.get("last_location"))
         loc_name = session["last_location"]["name"] if has_loc else ""
         text, markup = _build_group_keyboard(count, has_loc, loc_name)
-
-        # خزّن group_id الحالي حتى نعرف أي مجموعة نعالج
-        session["active_group_id"] = media_group_id
 
         # احذف الرسالة القديمة وأرسل جديدة بالعدد المحدّث
         old_msg_id = session.get("group_msg_id")
@@ -819,24 +790,12 @@ async def receive_photo(update, context):
             reply_markup=markup
         )
         session["group_msg_id"] = sent.message_id
-
         return WAITING_LOCATION
 
-    # ── صورة منفردة (السلوك الأصلي)
-    if session.get("pending_photo") and session.get("last_location"):
-        session["photos"].append({
-            "photo":          session["pending_photo"],
-            "location":       session["last_location"],
-            "coords_dms":     session.get("last_coords_dms", ""),
-            "plot_no":        session.get("pending_plot", ""),
-            "note":           "",
-            "awareness_type": "",
-            "type":           "normal"
-        })
-        session["pending_photo"] = None
-        session["pending_plot"]  = ""
+    # ── صورة منفردة
+    session.setdefault("queued_photos", []).append(photo_bytes)
+    session["active_group_id"] = None
 
-    session["pending_photo"] = photo_bytes
     if session.get("last_location"):
         loc = session["last_location"]["name"]
         kb  = [[KeyboardButton("✅ نفس الموقع")], [KeyboardButton("📍 موقع جديد")]]
@@ -896,12 +855,10 @@ async def receive_location_text(update: Update, context: ContextTypes.DEFAULT_TY
                 "awareness_type": "",
                 "type":           "normal"
             })
-        session["pending_photo"]     = None
-        session["pending_plot"]      = ""
-        session["pending_photos"]    = []
-        session["pending_group_map"] = {}
-        session["active_group_id"]   = None
-        session["group_msg_id"]      = None
+        session["queued_photos"]    = []
+        session["pending_plot"]     = ""
+        session["active_group_id"]  = None
+        session["group_msg_id"]     = None
         return await next_after_location(session, update)
 
     if "موقع جديد" in text:
@@ -910,9 +867,7 @@ async def receive_location_text(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── انتهيت من الصور — اطلب الموقع
     if "انتهيت" in text:
-        group_map = session.get("pending_group_map", {})
-        total = sum(len(v) for v in group_map.values())
-        if total == 0 and not session.get("pending_photo"):
+        if not session.get("queued_photos"):
             await update.message.reply_text("❌ لا توجد صور! أرسل الصور أولاً.")
             return WAITING_PHOTO
         await ask_location(update)
@@ -957,10 +912,8 @@ async def process_location(update, session, lat, lng):
             "awareness_type": "",
             "type":           "normal"
         })
-    session["pending_photo"]     = None
+    session["queued_photos"]     = []
     session["pending_plot"]      = ""
-    session["pending_photos"]    = []
-    session["pending_group_map"] = {}
     session["active_group_id"]   = None
     session["group_msg_id"]      = None
     session["last_location"]     = loc_data
